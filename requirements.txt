@@ -1,1 +1,4 @@
+typer[all]
+textual
+python-dotenv
 Pillow
