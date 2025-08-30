@@ -4,8 +4,11 @@ import typer
 from rich.console import Console
 from rich.progress import Progress
 from rich.table import Table
+from rich.layout import Layout
+from rich.panel import Panel
 from photo_sorter.utils import get_creation_date
 import concurrent.futures
+import filecmp
 
 app = typer.Typer()
 console = Console()
@@ -55,6 +58,16 @@ class PhotoSorter:
         self.extension_mapping = extension_mapping
         self.sorted_files = []
         self.errors = []
+        self.file_counts = {}
+        self.processed_files = 0
+        self.skipped_files = []
+
+    def _check_disk_space(self, files_to_process):
+        total_size = sum(os.path.getsize(file) for file in files_to_process)
+        _, _, free_space = shutil.disk_usage(self.dest_dir)
+        if total_size > free_space:
+            console.print(f"[bold red]Error: Not enough disk space. Required: {total_size / (1024*1024):.2f} MB, Available: {free_space / (1024*1024):.2f} MB")
+            raise typer.Exit(code=1)
 
     def _process_file(self, file_path, progress, task):
         progress.update(task, advance=1)
@@ -67,6 +80,8 @@ class PhotoSorter:
             return None
 
         try:
+            self.processed_files += 1
+            self.file_counts[file_ext] = self.file_counts.get(file_ext, 0) + 1
             if file_ext in self.extension_mapping:
                 dest_path = os.path.join(self.dest_dir, self.extension_mapping[file_ext])
             else:
@@ -79,6 +94,21 @@ class PhotoSorter:
             filename = os.path.basename(file_path)
             dest_file_path = os.path.join(dest_path, filename)
             
+            if os.path.exists(dest_file_path):
+                if filecmp.cmp(file_path, dest_file_path, shallow=False):
+                    self.skipped_files.append((file_path, dest_file_path))
+                    return ("skipped", (file_path, dest_file_path))
+                else:
+                    i = 1
+                    while True:
+                        name, ext = os.path.splitext(filename)
+                        new_filename = f"{name}_{i}{ext}"
+                        new_dest_file_path = os.path.join(dest_path, new_filename)
+                        if not os.path.exists(new_dest_file_path):
+                            dest_file_path = new_dest_file_path
+                            break
+                        i += 1
+
             if not self.dry_run:
                 os.makedirs(dest_path, exist_ok=True)
                 shutil.copy2(file_path, dest_file_path)
@@ -91,6 +121,7 @@ class PhotoSorter:
     def sort(self):
         with Progress(console=console) as progress:
             files_to_process = [os.path.join(root, filename) for root, _, files in os.walk(self.source_dir) for filename in files]
+            self._check_disk_space(files_to_process)
             task = progress.add_task("[cyan]Sorting...", total=len(files_to_process))
 
             with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -101,6 +132,8 @@ class PhotoSorter:
                     if result:
                         if result[0] == "sorted":
                             self.sorted_files.append(result[1])
+                        elif result[0] == "skipped":
+                            self.skipped_files.append(result[1])
                         elif result[0] == "error":
                             self.errors.append(result[1])
 
@@ -108,6 +141,7 @@ class PhotoSorter:
 
     def print_summary(self):
         console.print("\n[bold green]Sorting Complete![/bold green]")
+        console.print(f"Processed {self.processed_files} files.")
 
         if self.sorted_files:
             table = Table(title="Sorted Files Summary")
@@ -117,7 +151,26 @@ class PhotoSorter:
             for source, dest in self.sorted_files:
                 table.add_row(source, dest)
             
-            console.print(table)
+            counts_table = Table(title="File Counts")
+            counts_table.add_column("File Type", style="cyan")
+            counts_table.add_column("Count", style="magenta")
+
+            for file_type, count in self.file_counts.items():
+                counts_table.add_row(file_type, str(count))
+
+            layout = Layout()
+            layout.split_row(Panel(table), Panel(counts_table))
+            console.print(layout)
+
+        if self.skipped_files:
+            skipped_table = Table(title="Skipped Files (Duplicates)")
+            skipped_table.add_column("Source", style="cyan")
+            skipped_table.add_column("Destination", style="yellow")
+
+            for source, dest in self.skipped_files:
+                skipped_table.add_row(source, dest)
+
+            console.print(skipped_table)
 
         if self.errors:
             error_table = Table(title="Errors")
