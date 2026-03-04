@@ -1,0 +1,10 @@
+[project]
+name = "photo-sorter"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]",
+    "textual",
+    "python-dotenv",
+    "Pillow",
+]

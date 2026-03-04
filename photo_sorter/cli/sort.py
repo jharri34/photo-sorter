@@ -6,9 +6,10 @@ from rich.progress import Progress
 from rich.table import Table
 from rich.layout import Layout
 from rich.panel import Panel
-from photo_sorter.utils import get_creation_date
+from photo_sorter.utils import get_file_metadata, analyze_disk_usage_by_file_type
 import concurrent.futures
 import filecmp
+from pathlib import Path
 
 app = typer.Typer()
 console = Console()
@@ -18,8 +19,8 @@ console = Console()
     help="Sort photos from a source directory to a destination directory."
 )
 def sort_photos_command(
-    source_dir: str = typer.Argument(..., help="The source directory containing the photos."),
-    dest_dir: str = typer.Argument(..., help="The destination directory to store the sorted photos."),
+    source_dir: Path = typer.Argument(..., help="The source directory containing the photos."),
+    dest_dir: Path = typer.Argument(..., help="The destination directory to store the sorted photos."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate the sorting process without copying files."),
     include: list[str] = typer.Option(None, "--include", help="File extensions to include (e.g., .jpg .png)."),
     exclude: list[str] = typer.Option(None, "--exclude", help="File extensions to exclude (e.g., .gif .raw)."),
@@ -28,11 +29,11 @@ def sort_photos_command(
     """
     Sorts photos from a source directory to a destination directory.
     """
-    if not os.path.isdir(source_dir):
+    if not source_dir.is_dir():
         console.print(f"[bold red]Error: Source directory '{source_dir}' not found.[/bold red]")
         raise typer.Exit(code=1)
 
-    if not os.path.isdir(dest_dir):
+    if not dest_dir.is_dir():
         console.print(f"Destination directory '{dest_dir}' not found. Creating it...")
         os.makedirs(dest_dir)
 
@@ -49,7 +50,7 @@ def sort_photos_command(
     sorter.sort()
 
 class PhotoSorter:
-    def __init__(self, source_dir, dest_dir, dry_run, include_types, exclude_types, extension_mapping):
+    def __init__(self, source_dir: Path, dest_dir: Path, dry_run: bool, include_types: list[str], exclude_types: list[str], extension_mapping: dict):
         self.source_dir = source_dir
         self.dest_dir = dest_dir
         self.dry_run = dry_run
@@ -63,16 +64,26 @@ class PhotoSorter:
         self.skipped_files = []
 
     def _check_disk_space(self, files_to_process):
-        total_size = sum(os.path.getsize(file) for file in files_to_process)
+        # Filter files based on include/exclude types before calculating total size
+        filtered_files = []
+        for file_path in files_to_process:
+            file_ext = file_path.suffix.lower()
+            if self.include_types and file_ext not in self.include_types:
+                continue
+            if self.exclude_types and file_ext in self.exclude_types:
+                continue
+            filtered_files.append(file_path)
+
+        total_size = sum(os.path.getsize(file) for file in filtered_files)
         _, _, free_space = shutil.disk_usage(self.dest_dir)
         if total_size > free_space:
             console.print(f"[bold red]Error: Not enough disk space. Required: {total_size / (1024*1024):.2f} MB, Available: {free_space / (1024*1024):.2f} MB")
             raise typer.Exit(code=1)
 
-    def _process_file(self, file_path, progress, task):
+    def _process_file(self, file_path: Path, progress, task):
         progress.update(task, advance=1)
         console.log(f"Processing {file_path}...")
-        file_ext = os.path.splitext(file_path)[1].lower()
+        file_ext = file_path.suffix.lower()
 
         if self.include_types and file_ext not in self.include_types:
             return None
@@ -83,34 +94,35 @@ class PhotoSorter:
             self.processed_files += 1
             self.file_counts[file_ext] = self.file_counts.get(file_ext, 0) + 1
             if file_ext in self.extension_mapping:
-                dest_path = os.path.join(self.dest_dir, self.extension_mapping[file_ext])
+                dest_path = self.dest_dir / self.extension_mapping[file_ext]
             else:
-                creation_date = get_creation_date(file_path)
+                metadata = get_file_metadata(file_path)
+                creation_date = metadata['original_date'] or metadata['creation_date']
                 year = creation_date.strftime("%Y")
                 month = creation_date.strftime("%m")
-                file_type = file_ext[1:].upper()
-                dest_path = os.path.join(self.dest_dir, year, month, file_type)
+                file_type = metadata['file_type']
+                dest_path = self.dest_dir / year / month / file_type
             
-            filename = os.path.basename(file_path)
-            dest_file_path = os.path.join(dest_path, filename)
+            filename = file_path.name
+            dest_file_path = dest_path / filename
             
-            if os.path.exists(dest_file_path):
+            if dest_file_path.exists():
                 if filecmp.cmp(file_path, dest_file_path, shallow=False):
                     self.skipped_files.append((file_path, dest_file_path))
                     return ("skipped", (file_path, dest_file_path))
                 else:
                     i = 1
                     while True:
-                        name, ext = os.path.splitext(filename)
+                        name, ext = file_path.stem, file_path.suffix
                         new_filename = f"{name}_{i}{ext}"
-                        new_dest_file_path = os.path.join(dest_path, new_filename)
-                        if not os.path.exists(new_dest_file_path):
+                        new_dest_file_path = dest_path / new_filename
+                        if not new_dest_file_path.exists():
                             dest_file_path = new_dest_file_path
                             break
                         i += 1
 
             if not self.dry_run:
-                os.makedirs(dest_path, exist_ok=True)
+                dest_path.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file_path, dest_file_path)
             
             return ("sorted", (file_path, dest_file_path))
@@ -120,7 +132,7 @@ class PhotoSorter:
 
     def sort(self):
         with Progress(console=console) as progress:
-            files_to_process = [os.path.join(root, filename) for root, _, files in os.walk(self.source_dir) for filename in files]
+            files_to_process = [file_path for file_path in self.source_dir.rglob('*') if file_path.is_file()]
             self._check_disk_space(files_to_process)
             task = progress.add_task("[cyan]Sorting...", total=len(files_to_process))
 
@@ -149,7 +161,7 @@ class PhotoSorter:
             table.add_column("Destination", style="magenta")
 
             for source, dest in self.sorted_files:
-                table.add_row(source, dest)
+                table.add_row(str(source), str(dest))
             
             counts_table = Table(title="File Counts")
             counts_table.add_column("File Type", style="cyan")
@@ -168,7 +180,7 @@ class PhotoSorter:
             skipped_table.add_column("Destination", style="yellow")
 
             for source, dest in self.skipped_files:
-                skipped_table.add_row(source, dest)
+                skipped_table.add_row(str(source), str(dest))
 
             console.print(skipped_table)
 
@@ -178,6 +190,77 @@ class PhotoSorter:
             error_table.add_column("Error", style="red")
 
             for file, error in self.errors:
-                error_table.add_row(file, error)
+                error_table.add_row(str(file), error)
 
             console.print(error_table)
+
+
+@app.command(
+    "disk-usage",
+    help="Analyze disk space usage by file type in a directory."
+)
+def disk_usage_command(
+    directory: Path = typer.Argument(..., help="The directory to analyze.")
+):
+    """
+    Analyzes disk space usage by file type and reports it in a table with bars.
+    """
+    if not directory.is_dir():
+        console.print(f"[bold red]Error: Directory '{directory}' not found.[/bold red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[bold green]Analyzing disk usage in '{directory}'...\n[/bold green]")
+
+    try:
+        file_type_sizes = analyze_disk_usage_by_file_type(directory)
+
+        if not file_type_sizes:
+            console.print("[yellow]No files found or no disk usage to report.[/yellow]")
+            return
+
+        total_size_bytes = sum(size for _, size in file_type_sizes)
+
+        table = Table(title="Disk Usage by File Type", show_footer=True)
+        table.add_column("File Type", style="cyan", no_wrap=True)
+        table.add_column("Size", style="magenta", justify="right")
+        table.add_column("Percentage", style="green", justify="right")
+        table.add_column("Bar", style="blue", justify="left")
+
+        max_bar_length = 30
+
+        def format_size(size_bytes: int) -> str:
+            if size_bytes < 1024:
+                return f"{size_bytes} B"
+            elif size_bytes < 1024**2:
+                return f"{size_bytes / 1024:.2f} KB"
+            elif size_bytes < 1024**3:
+                return f"{size_bytes / (1024**2):.2f} MB"
+            elif size_bytes < 1024**4:
+                return f"{size_bytes / (1024**3):.2f} GB"
+            else:
+                return f"{size_bytes / (1024**4):.2f} TB"
+
+        for file_type, size_bytes in file_type_sizes:
+            percentage = (size_bytes / total_size_bytes) * 100 if total_size_bytes > 0 else 0
+            bar_length = int((percentage / 100) * max_bar_length)
+            bar = "█" * bar_length + "░" * (max_bar_length - bar_length)
+            table.add_row(
+                file_type,
+                format_size(size_bytes),
+                f"{percentage:.2f}%",
+                bar
+            )
+        
+        table.add_section()
+        table.add_row(
+            "[bold]TOTAL[/bold]",
+            f"[bold]{format_size(total_size_bytes)}[/bold]",
+            "[bold]100.00%[/bold]",
+            ""
+        )
+
+        console.print(table)
+
+    except Exception as e:
+        console.print(f"[bold red]An error occurred: {e}[/bold red]")
+        raise typer.Exit(code=1)
